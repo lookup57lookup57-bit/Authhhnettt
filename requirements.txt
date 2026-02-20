@@ -1,0 +1,6 @@
+python-telegram-bot==20.7
+aiohttp==3.9.1
+nest-asyncio==1.5.8
+faker==20.1.0
+pandas==2.1.4
+colorama==0.4.6
